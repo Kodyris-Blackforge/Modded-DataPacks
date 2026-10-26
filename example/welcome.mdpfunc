@@ -1,0 +1,53 @@
+//---MDP CONFIGS---
+cfg.Enabled = true    //Configuration Enabled (Allows running)
+cfg.Permission = 0    //Configuration Minimum Permission usability (0=any)
+//---FUNC BELOW---
+
+evt playerjoin(<player>) {
+tellraw @a {"text":"[mdp] <player.name> (<player.uuid>) joined","color":"gold"}
+}
+
+evt teamjoin(<player>,<team>) {
+tellraw @a {"text":"[mdp] <player> joined team <team>","color":"aqua"}
+}
+
+evt tagadded(<player>,<tagname>) {
+tellraw @a {"text":"[mdp] <player> got tag <tagname>","color":"green"}
+}
+
+// evt tick {
+// scoreboard players add #ticks timer 1
+// }
+
+function Ping() {
+tellraw @s {"text":"pong"}
+}
+
+@perm=op
+function GiveKit(<player>) {
+give <player> minecraft:bread 16
+tellraw <player> {"text":"Kit delivered","color":"green"}
+}
+
+// Conditions: strings, numbers, bools and "exists in <file>.json" (path is relative to ModDataPacks).
+// Add your own uuid (use /data get entity @s UUID or <player.uuid> in a tellraw) to vip.json to see the VIP branch.
+function VipKit(<player>) {
+if <player.uuid> exists in vip.json {
+give <player> minecraft:diamond 1
+tellraw <player> {"text":"VIP kit delivered","color":"gold"}
+} else if <player.name> == "Dev" {
+tellraw <player> {"text":"Welcome, Dev","color":"aqua"}
+} else {
+tellraw <player> {"text":"VIP only","color":"red"}
+}
+}
+
+function Level(<player>,<score>) {
+if <score> >= 90 && <score> <= 100 {
+tellraw <player> {"text":"gold"}
+} else if <score> >= 50 {
+tellraw <player> {"text":"silver"}
+} else {
+tellraw <player> {"text":"keep going"}
+}
+}
