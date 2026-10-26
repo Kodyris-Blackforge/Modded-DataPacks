@@ -1,3 +1,6 @@
+> [!NOTE]
+> AI USAGE (Full generation)   Code is tested regularly to ensure valid/working
+
 # ModDataPacks (mdp) - Forge 1.20.1
 
 Server-side mod. Loads `.mdpfunc` scripts from `<minecraft root>/ModDataPacks/` (any subfolders).
