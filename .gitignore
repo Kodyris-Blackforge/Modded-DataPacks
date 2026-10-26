@@ -1,0 +1,8 @@
+.gradle/
+build/
+run/*
+!run/ModDataPacks/
+.idea/
+*.iml
+eclipse/
+bin/
