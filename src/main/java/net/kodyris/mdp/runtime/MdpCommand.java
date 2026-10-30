@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * /mdp run <file>:<Func> [args...]   anyone who meets the function's permission
@@ -36,6 +37,16 @@ public final class MdpCommand {
                 .executes(c -> reload(c.getSource())))
             .then(Commands.literal("status").requires(s -> s.hasPermission(2))
                 .executes(c -> status(c.getSource())))
+            .then(Commands.literal("init").requires(s -> s.hasPermission(2))
+                .then(Commands.literal("run")
+                    .then(Commands.argument("file", StringArgumentType.greedyString())
+                        .suggests((c, sb) -> SharedSuggestionProvider.suggest(MdpRuntime.filesWithInit().stream(), sb))
+                        .executes(c -> initRun(c.getSource(), StringArgumentType.getString(c, "file")))))
+                .then(Commands.literal("reset")
+                    .then(Commands.argument("file", StringArgumentType.greedyString())
+                        .suggests((c, sb) -> SharedSuggestionProvider.suggest(
+                            Stream.concat(Stream.of("*"), MdpRuntime.filesWithInit().stream()), sb))
+                        .executes(c -> initReset(c.getSource(), StringArgumentType.getString(c, "file"))))))
             .then(Commands.literal("run")
                 .then(Commands.argument("call", StringArgumentType.greedyString())
                     .suggests(MdpCommand::suggest)
@@ -95,9 +106,35 @@ public final class MdpCommand {
         return 1;
     }
 
+    private static int initRun(CommandSourceStack src, String file) throws CommandSyntaxException {
+        try {
+            int n = MdpRuntime.runInitNow(src.getServer(), file.trim());
+            src.sendSuccess(() -> Component.literal("[mdp] ran init for " + file.trim() + " (" + n + " block(s))"), true);
+            return n;
+        } catch (IllegalArgumentException e) {
+            throw err(e.getMessage());
+        }
+    }
+
+    private static int initReset(CommandSourceStack src, String file) throws CommandSyntaxException {
+        try {
+            boolean changed = MdpRuntime.resetInit(src.getServer(), file.trim());
+            String msg = changed
+                ? "[mdp] init will run again for " + (file.trim().equals("*") ? "every file" : file.trim()) + " on the next /mdp reload"
+                : "[mdp] nothing to reset: " + file.trim() + " is not marked as initialized";
+            src.sendSuccess(() -> Component.literal(msg), true);
+            return changed ? 1 : 0;
+        } catch (IllegalArgumentException e) {
+            throw err(e.getMessage());
+        }
+    }
+
     private static int reload(CommandSourceStack src) {
         String summary = MdpRuntime.reload(src.getServer());
         src.sendSuccess(() -> Component.literal("[mdp] reloaded: " + summary), true);
+
+        if (!MdpRuntime.lastInitRan().isEmpty())
+            send(src, ChatFormatting.GREEN, "Init ran for: " + String.join(", ", MdpRuntime.lastInitRan()));
 
         List<MdpBlock> empty = MdpRuntime.registry().emptyBlocks();
         if (!empty.isEmpty()) {
@@ -125,7 +162,8 @@ public final class MdpCommand {
                 continue;
             }
             send(src, f.usable() ? ChatFormatting.GREEN : ChatFormatting.YELLOW,
-                f.id() + " enabled=" + f.config().enabled() + " perm=" + f.config().permission() + " blocks=" + f.blocks().size());
+                f.id() + " enabled=" + f.config().enabled() + " perm=" + f.config().permission() + " blocks=" + f.blocks().size()
+                + (MdpRuntime.initStatus(src.getServer(), f.id()) != null ? " init=" + MdpRuntime.initStatus(src.getServer(), f.id()) : ""));
             for (MdpBlock b : f.blocks()) {
                 if (!b.isActive()) {
                     send(src, ChatFormatting.RED, "  " + b.file() + ":" + b.line() + " " + b.kind() + " " + b.name() + " - " + b.disabledReason());

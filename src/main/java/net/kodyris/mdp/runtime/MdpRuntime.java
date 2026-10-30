@@ -13,6 +13,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.ServerFunctionManager;
 import net.minecraft.commands.CommandFunction;
+import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.scores.Team;
 import net.minecraftforge.fml.loading.FMLPaths;
 
@@ -39,6 +40,112 @@ public final class MdpRuntime {
 
     private record Snapshot(Set<String> tags, String team) {}
 
+    // ------------------------------------------------------------------ evt init (once per world)
+
+    /** Which files already ran their "evt init" in this world (mdp_state.json in the world folder). */
+    private static InitState initState;
+    private static boolean runningInit = false;
+    private static List<String> lastInitRan = new ArrayList<>();
+
+    private static InitState initState(MinecraftServer server) {
+        if (initState == null) initState = new InitState(server.getWorldPath(LevelResource.ROOT).resolve("mdp_state.json"));
+        return initState;
+    }
+
+    /** Files that ran their init during the most recent load. */
+    public static List<String> lastInitRan() { return lastInitRan; }
+
+    /** Active, non-empty "evt init" blocks of usable files, grouped by file. */
+    private static Map<String, List<MdpBlock>> initBlocksByFile() {
+        Map<String, List<MdpBlock>> out = new LinkedHashMap<>();
+        for (MdpBlock b : registry.eventBlocks("init")) {
+            MdpFile f = registry.file(b.file());
+            if (f != null && f.usable() && b.isActive() && !b.body().isEmpty())
+                out.computeIfAbsent(b.file(), k -> new ArrayList<>()).add(b);
+        }
+        return out;
+    }
+
+    public static Set<String> filesWithInit() { return initBlocksByFile().keySet(); }
+
+    /** "done", "pending", or null if the file has no init. */
+    public static String initStatus(MinecraftServer server, String fileId) {
+        if (!initBlocksByFile().containsKey(fileId)) return null;
+        InitState st = initState(server);
+        if (st.error() != null) return "unreadable state file";
+        return st.isDone(fileId) ? "done" : "pending";
+    }
+
+    private static void runInitBlocks(MinecraftServer server, List<MdpBlock> blocks) {
+        CommandSourceStack src = server.createCommandSourceStack().withPermission(4);
+        for (MdpBlock b : blocks) execute(server, src, b, new HashMap<>());
+    }
+
+    /**
+     * Runs each file's init the first time it is seen in this world. The record is written BEFORE the
+     * handler runs, so a handler that reloads or crashes can never run twice. If the record cannot be
+     * saved, init is not run (running it again later could be destructive).
+     */
+    private static void runInits(MinecraftServer server) {
+        if (runningInit) return;
+        Map<String, List<MdpBlock>> byFile = initBlocksByFile();
+        if (byFile.isEmpty()) return;
+
+        InitState st = initState(server);
+        if (st.error() != null) {
+            MdpMod.LOGGER.error("[mdp] init skipped: {} is unreadable ({}). Fix or delete it. Nothing was run.", st.file(), st.error());
+            return;
+        }
+        runningInit = true;
+        try {
+            for (Map.Entry<String, List<MdpBlock>> e : byFile.entrySet()) {
+                if (st.isDone(e.getKey())) continue;
+                st.markDone(e.getKey());
+                try {
+                    st.save();
+                } catch (IOException ex) {
+                    st.reset(e.getKey());
+                    MdpMod.LOGGER.error("[mdp] init for '{}' not run: could not save {} ({})", e.getKey(), st.file(), ex.getMessage());
+                    continue;
+                }
+                runInitBlocks(server, e.getValue());
+                lastInitRan.add(e.getKey());
+                MdpMod.LOGGER.info("[mdp] ran init for '{}' (first load in this world)", e.getKey());
+            }
+        } finally {
+            runningInit = false;
+        }
+    }
+
+    /** /mdp init run: runs a file's init now, even if it already ran, and records it as done. */
+    public static int runInitNow(MinecraftServer server, String fileId) {
+        List<MdpBlock> blocks = initBlocksByFile().get(fileId);
+        if (blocks == null) throw new IllegalArgumentException("'" + fileId + "' has no active evt init block");
+        InitState st = initState(server);
+        if (st.error() != null) throw new IllegalArgumentException(st.file().getFileName() + " is unreadable: " + st.error());
+        st.markDone(fileId);
+        try {
+            st.save();
+        } catch (IOException e) {
+            throw new IllegalArgumentException("could not save " + st.file().getFileName() + ": " + e.getMessage());
+        }
+        runInitBlocks(server, blocks);
+        return blocks.size();
+    }
+
+    /** /mdp init reset: forget that init ran, so it runs again on the next load. "*" = every file. */
+    public static boolean resetInit(MinecraftServer server, String fileIdOrAll) {
+        InitState st = initState(server);
+        if (st.error() != null) throw new IllegalArgumentException(st.file().getFileName() + " is unreadable: " + st.error());
+        boolean changed = st.reset(fileIdOrAll);
+        try {
+            st.save();
+        } catch (IOException e) {
+            throw new IllegalArgumentException("could not save " + st.file().getFileName() + ": " + e.getMessage());
+        }
+        return changed;
+    }
+
     /** Backs "exists in <file>.json": files live under ModDataPacks and are re-read when they change. */
     private static JsonLists lists;
     /** Condition errors already logged for events, so a tick handler can't flood the log. */
@@ -50,10 +157,53 @@ public final class MdpRuntime {
     }
 
     private static final class CondContext implements MdpExpr.Context {
+        private final MinecraftServer server;
         private final Map<String, String> vars;
-        CondContext(Map<String, String> vars) { this.vars = vars; }
+        CondContext(MinecraftServer server, Map<String, String> vars) { this.server = server; this.vars = vars; }
         public String var(String key) { return vars.get(key); }
         public boolean listContains(String path, String value) throws ListException { return lists().contains(path, value); }
+        public boolean fileExists(String path) throws ListException { return lists().exists(path); }
+
+        private ServerPlayer player(String playerVar) {
+            String uuid = vars.get(playerVar + ".uuid");
+            if (uuid == null) return null;
+            try {
+                return server.getPlayerList().getPlayer(UUID.fromString(uuid));
+            } catch (IllegalArgumentException e) {
+                return null;
+            }
+        }
+
+        /** Live read of the player's tags at the moment the call starts. Null if the player is offline. */
+        public Boolean hasTag(String playerVar, String tag) {
+            ServerPlayer p = player(playerVar);
+            return p == null ? null : p.getTags().contains(tag);
+        }
+
+        /** How many online players have the tag right now (spectators included). */
+        public Integer countTagged(String tag) {
+            int n = 0;
+            for (ServerPlayer p : server.getPlayerList().getPlayers()) if (p.getTags().contains(tag)) n++;
+            return n;
+        }
+
+        /** How many online players are on the team right now. */
+        public Integer countOnTeam(String team) {
+            int n = 0;
+            for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                Team t = p.getTeam();
+                if (t != null && t.getName().equals(team)) n++;
+            }
+            return n;
+        }
+
+        /** Live read of the player's team at the moment the call starts. Null if the player is offline. */
+        public Boolean hasTeam(String playerVar, String team) {
+            ServerPlayer p = player(playerVar);
+            if (p == null) return null;
+            Team t = p.getTeam();
+            return t != null && t.getName().equals(team);
+        }
     }
 
     /** Referenced list files that do not exist (yet), with the blocks that use them. */
@@ -79,6 +229,7 @@ public final class MdpRuntime {
         SNAPSHOTS.clear();
         WARNED.clear();
         lists = null;
+        initState = null;
     }
 
     // ------------------------------------------------------------------ loading
@@ -109,6 +260,11 @@ public final class MdpRuntime {
         lists = new JsonLists(root());
         for (ServerPlayer p : server.getPlayerList().getPlayers()) SNAPSHOTS.put(p.getUUID(), snapshot(p));
         String summary = report(fresh);
+
+        // 'init' first (once per world, per file), then 'loaded' (every load).
+        initState = null;                         // re-read mdp_state.json, so hand edits are honoured
+        lastInitRan = new ArrayList<>();
+        runInits(server);
 
         // 'loaded' runs once the new scripts are live: at server start and after every /mdp reload.
         // Guard against a loaded handler that itself calls /mdp reload.
@@ -237,7 +393,9 @@ public final class MdpRuntime {
         Matcher m = MdpVars.VAR.matcher(line);
         while (m.find()) {
             String key = m.group(1);
-            if (b.params().contains(MdpVars.baseName(key)) && !dummy.containsKey(key)) return true;
+            String base = MdpVars.baseName(key);
+            if (b.locals().contains(base)) return true;          // a local's value isn't known until the block runs
+            if (b.params().contains(base) && !dummy.containsKey(key)) return true;
         }
         return false;
     }
@@ -249,20 +407,27 @@ public final class MdpRuntime {
         MdpFile f = registry.file(b.file());
         if (f == null || !f.usable() || !b.isActive() || b.body().isEmpty()) return;
 
+        // Like datapack functions (and /function), the commands inside run with their feedback suppressed.
+        // Otherwise a tick handler would print "Set score..." to the console 20 times a second, and a
+        // join handler would show "Gave 1 item" in chat. tellraw, say, title etc. still show normally.
+        // Errors for the caller go through 'caller', which is not suppressed.
+        CommandSourceStack caller = src;
+        src = src.withSuppressedOutput();
+
         try {
             CommandFunction fn = COMPILED.get(b);
             if (fn == null) {
                 // if/else conditions are decided per call, from this call's variables and the list files.
-                MdpBlock.Selected sel = b.select(new CondContext(vars));
+                MdpBlock.Selected sel = b.select(new CondContext(server, vars));
                 for (String problem : sel.errors()) {
                     if (b.kind() == BlockKind.FUNC) {
-                        src.sendFailure(Component.literal("[mdp] " + b.key() + " - condition error, " + problem));
+                        caller.sendFailure(Component.literal("[mdp] " + b.key() + " - condition error, " + problem));
                     } else if (WARNED.add(b.key() + "|" + problem)) {     // once per reload, not once per tick
                         MdpMod.LOGGER.warn("[mdp] {} '{}' ({}:{}) - condition error, {}", b.kind(), b.name(), b.file(), b.line(), problem);
                     }
                 }
                 if (sel.lines().isEmpty()) return;
-                List<String> lines = sel.lines().stream().map(l -> MdpVars.substitute(l, vars)).toList();
+                List<String> lines = sel.lines();     // <variables> were already filled in by select()
                 fn = CommandFunction.fromLines(
                         new ResourceLocation(MdpMod.MODID, "blk_" + Integer.toHexString((b.file() + ":" + b.line()).hashCode())),
                         server.getCommands().getDispatcher(), src, lines);
@@ -281,7 +446,7 @@ public final class MdpRuntime {
                 // Functions parse with the caller's own permissions and caller-supplied arguments, so a
                 // failure can be a caller problem (missing permission, bad value). Report it to the
                 // caller; never disable the function for everyone because of it.
-                src.sendFailure(Component.literal("[mdp] " + b.key() + " could not run: " + e.getMessage()));
+                caller.sendFailure(Component.literal("[mdp] " + b.key() + " could not run: " + e.getMessage()));
             }
         } catch (Exception e) {
             MdpMod.LOGGER.warn("[mdp] error running '{}' ({}:{}): {}", b.name(), b.file(), b.line(), e.toString());
