@@ -34,11 +34,11 @@ tellraw <player> {"text":"Kit delivered","color":"green"}
 function VipKit(<player>) {
 if <player.uuid> exists in vip.json {
 give <player> minecraft:diamond 1
-tellraw <player> {"text":"VIP kit delivered","color":"gold"}
+say "VIP kit delivered"
 } else if <player.name> == "Dev" {
-tellraw <player> {"text":"Welcome, Dev","color":"aqua"}
+say "Welcome, <player.name>"
 } else {
-tellraw <player> {"text":"VIP only","color":"red"}
+say "VIP only"
 }
 }
 
