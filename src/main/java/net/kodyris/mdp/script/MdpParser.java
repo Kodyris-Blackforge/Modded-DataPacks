@@ -23,7 +23,7 @@ public final class MdpParser {
     public static final int HEADER_LINES = 4;
 
     private static final Map<String, Integer> ARITY =
-        Map.of("loaded", 0, "tick", 0, "playerjoin", 1, "teamjoin", 2, "tagadded", 2);
+        Map.of("init", 0, "loaded", 0, "tick", 0, "playerjoin", 1, "teamjoin", 2, "tagadded", 2);
 
     private static final Pattern HEADER =
         Pattern.compile("^(evt|func|function)\\s+(\\w+)\\s*(?:\\(([^)]*)\\))?\\s*\\{\\s*(\\})?$");
@@ -218,6 +218,15 @@ public final class MdpParser {
             }
 
             if (cur != null) {
+                InlineIf one = inlineIf(t);
+                if (one != null) {
+                    cur.markConditions();
+                    if (one.error() != null) { cur.disable("line " + ln + ": " + one.error()); continue; }
+                    openIf(cur, frames, one.cond(), ln);
+                    if (!one.body().isEmpty()) addStatement(cur, frames, one.body(), ln);
+                    frames.pop();                      // a one-line if opens and closes in the same line
+                    continue;
+                }
                 Matcher ifm = IF_LINE.matcher(t);
                 if (ifm.matches()) { openIf(cur, frames, ifm.group(1), ln); continue; }
                 if (IF_WORD.matcher(t).find()) {
@@ -238,7 +247,7 @@ public final class MdpParser {
                     if (!frames.isEmpty()) frames.pop(); else cur = null;
                     continue;
                 }
-                cur.addBodyLine(t, ln, guard(frames));
+                addStatement(cur, frames, t, ln);
                 continue;
             }
 
@@ -266,6 +275,301 @@ public final class MdpParser {
         if (!pending.isEmpty() || !pendingErrs.isEmpty())
             f.warnings().add(file + ": annotations at end of file dropped, no block follows them");
         for (MdpBlock b : f.blocks()) checkVarRefs(b);
+    }
+
+    private static final Pattern SAY_START = Pattern.compile("^say\\s+[\"{]");
+    private static final Pattern SAY_TO_VAR = Pattern.compile("^to\\s+<(\\w+(?:\\.\\w+)?)>$");
+    private static final Pattern LOCAL_DECL = Pattern.compile("^local\\s+([A-Za-z_]\\w*)\\s*=(?!=)\\s*(.*)$");
+    private static final Pattern LOCAL_WORD = Pattern.compile("^local(\\s|$)");
+    private static final Pattern ASSIGN = Pattern.compile("^([A-Za-z_]\\w*)\\s*=(?!=)\\s*(.*)$");
+    private static final Set<String> RESERVED_NAMES = Set.of("true", "false");
+    private static final Pattern IF_PREFIX = Pattern.compile("^if\\s+");
+
+    /** An "if <condition> { <command> }" written on one line. */
+    private record InlineIf(String cond, String body, String error) {}
+
+    /**
+     * Splits a one-line if. Returns null when the line is not one (a non-if line, or the block form
+     * "if <condition> {"), so the normal handling runs. A malformed one-line if comes back with an error.
+     * Braces inside double-quoted strings are ignored and braces in the command (JSON/NBT) must balance.
+     */
+    private static InlineIf inlineIf(String t) {
+        Matcher m = IF_PREFIX.matcher(t);
+        if (!m.find()) return null;
+        String rest = t.substring(m.end());
+        int open = braceOutsideQuotes(rest);
+        if (open < 0) return null;
+        if (open == rest.length() - 1) return null;                    // "if <condition> {": the block form
+        int close = matchingBrace(rest, open);
+        if (close < 0) return new InlineIf(null, null, "a one-line 'if' is missing its closing '}'");
+        if (close != rest.length() - 1)
+            return new InlineIf(null, null, "a one-line 'if' can't be followed by anything, and has no inline 'else'; use the block form: if <condition> { ... } else { ... }");
+        String cond = rest.substring(0, open).strip();
+        String body = rest.substring(open + 1, close).strip();
+        if (cond.isEmpty()) return new InlineIf(null, null, "malformed 'if', expected: if <condition> { <command> }");
+        if (IF_WORD.matcher(body).find() || ELSE_WORD.matcher(body).find())
+            return new InlineIf(null, null, "a one-line 'if' holds a single command; nest with the block form instead");
+        return new InlineIf(cond, body, null);
+    }
+
+    private static int braceOutsideQuotes(String s) {
+        boolean quoted = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quoted) {
+                if (c == '\\') i++;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{') return i;
+        }
+        return -1;
+    }
+
+    /** Index of the '}' that closes the '{' at 'open', or -1. */
+    private static int matchingBrace(String s, int open) {
+        int depth = 0;
+        boolean quoted = false;
+        for (int i = open; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quoted) {
+                if (c == '\\') i++;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    /** A body line is a 'local' declaration, an assignment to a local, or a command. */
+    private static void addStatement(MdpBlock b, Deque<Frame> frames, String t, int ln) {
+        Matcher d = LOCAL_DECL.matcher(t);
+        if (d.matches()) { declareLocal(b, frames, d.group(1), d.group(2), ln); return; }
+        if (LOCAL_WORD.matcher(t).find()) {
+            b.disable("line " + ln + ": malformed 'local', expected: local Name = value");
+            return;
+        }
+        if (SAY_START.matcher(t).find()) { addSay(b, frames, t, ln); return; }
+        Matcher a = ASSIGN.matcher(t);
+        if (a.matches()) { assignLocal(b, frames, a.group(1), a.group(2), ln); return; }
+        b.addBodyLine(t, ln, guard(frames));
+    }
+
+    private static final List<String> MC_COLORS = List.of("black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple",
+        "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white");
+    private static final Pattern COLOR_KEY = Pattern.compile(
+        "([{,]\\s*)(\"?)(MCCOL|hex)(\"?)(\\s*:\\s*)(\"?)(#?)([A-Za-z0-9_]*)(\"?)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern COLOR_TYPO = Pattern.compile("\"\\s*:\\s*(MCCOL|hex)\\s*:", Pattern.CASE_INSENSITIVE);
+    private static final Pattern COLOR_LEFTOVER = Pattern.compile("\\b(MCCOL|hex)\\b", Pattern.CASE_INSENSITIVE);
+
+    /** True if a double-quoted string is still open at the end of the text. */
+    private static boolean endsInsideString(String s) {
+        boolean quoted = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quoted) {
+                if (c == '\\') i++;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+        }
+        return quoted;
+    }
+
+    /** true for every character that is inside a double-quoted string (quotes included). */
+    private static boolean[] quotedMask(String s) {
+        boolean[] mask = new boolean[s.length()];
+        boolean quoted = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quoted) {
+                mask[i] = true;
+                if (c == '\\') { if (i + 1 < s.length()) mask[++i] = true; }
+                else if (c == '"') quoted = false;
+            } else if (c == '"') {
+                quoted = true;
+                mask[i] = true;
+            }
+        }
+        return mask;
+    }
+
+    /**
+     * Turns the mdp colour keys inside a text component into the real "color" field:
+     *   MCCOL:gold   (one of the 16 Minecraft colours)   ->  color:"gold"
+     *   hex:ffaa00   (6 hex digits, # optional)          ->  color:"#ffaa00"
+     * Only keys written as a field of the component are touched; text inside strings is left alone.
+     * Throws IllegalArgumentException with a user-facing message if a key is malformed.
+     */
+    static String rewriteColors(String comp) {
+        boolean[] in = quotedMask(comp);
+
+        Matcher typo = COLOR_TYPO.matcher(comp);
+        while (typo.find()) {
+            if (!in[comp.indexOf(':', typo.start())])
+                throw new IllegalArgumentException("separate fields with a comma, not a colon: {text:\"...\",hex:ffaa00} (found '" + typo.group().strip() + "')");
+        }
+
+        Matcher m = COLOR_KEY.matcher(comp);
+        StringBuilder out = new StringBuilder();
+        int last = 0;
+        while (m.find()) {
+            if (in[m.start()]) continue;                      // the { or , is inside a string: not a field
+            boolean named = m.group(3).equalsIgnoreCase("MCCOL");
+            String val = m.group(8);
+            if (!m.group(6).equals(m.group(9))) throw new IllegalArgumentException("unbalanced quotes around the " + m.group(3) + " value");
+            String color;
+            if (named) {
+                String name = val.toLowerCase(Locale.ROOT);
+                if (!MC_COLORS.contains(name))
+                    throw new IllegalArgumentException("MCCOL needs one of the Minecraft colours (" + String.join(", ", MC_COLORS) + "), found '" + val + "'");
+                color = "\"" + name + "\"";
+            } else {
+                if (!val.matches("[0-9A-Fa-f]{6}"))
+                    throw new IllegalArgumentException("hex needs 6 hex digits like ffaa00 (a leading # is fine), found '" + m.group(7) + val + "'");
+                color = "\"#" + val.toLowerCase(Locale.ROOT) + "\"";
+            }
+            out.append(comp, last, m.start()).append(m.group(1))
+               .append(m.group(2).isEmpty() ? "color" : "\"color\"").append(":").append(color);
+            last = m.end();
+        }
+        out.append(comp.substring(last));
+
+        String result = out.toString();
+        boolean[] inResult = quotedMask(result);
+        Matcher left = COLOR_LEFTOVER.matcher(result);
+        while (left.find()) {
+            if (!inResult[left.start()])
+                throw new IllegalArgumentException("'" + left.group() + "' must be written as a field, like MCCOL:gold or hex:ffaa00, after a '{' or a ','");
+        }
+        return result;
+    }
+
+    /**
+     * say "message"                      plain text
+     * say {text:"message",color:gold}    a text component, written the same way as in tellraw
+     * say {text:"message",MCCOL:gold}    MCCOL:<colour> and hex:<rrggbb> are shortcuts for the colour field
+     * ...either one followed by:   (nothing) = the block's player  |  to <player>  |  to everyone  (also: to all)
+     *
+     * Both turn into "tellraw <target> <component>". The message / component may use <variables> and locals;
+     * their values are escaped, so a quote or backslash in a value can't break the JSON.
+     * It is only this effect when the message starts with a double quote or a '{'; anything else after
+     * "say" (for example "say hello") stays the vanilla command.
+     */
+    private static void addSay(MdpBlock b, Deque<Frame> frames, String t, int ln) {
+        String after = t.substring(3).stripLeading();
+        String component;
+        String rest;
+
+        if (after.charAt(0) == '"') {
+            StringBuilder msg = new StringBuilder();
+            int j = 1;
+            boolean closed = false;
+            while (j < after.length()) {
+                char c = after.charAt(j);
+                if (c == '\\' && j + 1 < after.length() && (after.charAt(j + 1) == '"' || after.charAt(j + 1) == '\\')) {
+                    msg.append(after.charAt(j + 1));
+                    j += 2;
+                } else if (c == '"') {
+                    closed = true;
+                    j++;
+                    break;
+                } else {
+                    msg.append(c);
+                    j++;
+                }
+            }
+            if (!closed) { b.disable("line " + ln + ": say \"...\" has an unterminated string"); return; }
+            component = "{\"text\":" + MdpBlock.jsonString(msg.toString()) + "}";
+            rest = after.substring(j);
+        } else {
+            int close = matchingBrace(after, 0);
+            if (close < 0) {
+                b.disable("line " + ln + ": say {...} " + (endsInsideString(after)
+                    ? "has an unterminated string (a closing \" is missing)" : "is missing its closing '}'"));
+                return;
+            }
+            try {
+                component = rewriteColors(after.substring(0, close + 1));
+            } catch (IllegalArgumentException e) {
+                b.disable("line " + ln + ": say {...}: " + e.getMessage());
+                return;
+            }
+            rest = after.substring(close + 1);
+        }
+
+        rest = rest.strip().replaceAll("\\s+", " ");
+        String target;
+        if (rest.isEmpty()) {
+            if (b.playerParams().isEmpty()) {
+                b.disable("line " + ln + ": say has no player to message in this block; use: say ... to everyone");
+                return;
+            }
+            target = b.playerParams().iterator().next();
+        } else if (rest.equals("to everyone") || rest.equals("to all")) {
+            target = "*";
+        } else {
+            Matcher m = SAY_TO_VAR.matcher(rest);
+            if (!m.matches()) {
+                b.disable("line " + ln + ": after the message expected 'to <player>' or 'to everyone', found: " + rest);
+                return;
+            }
+            String key = m.group(1), base = MdpVars.baseName(key);
+            if (!b.isPlayerParam(base)) { b.disable("line " + ln + ": 'to <" + key + ">' needs a player, but <" + base + "> is not one"); return; }
+            if (key.length() > base.length() && !MdpVars.PLAYER_PROPS.contains(key.substring(base.length() + 1))) {
+                b.disable("line " + ln + ": unknown player property in 'to <" + key + ">' (available: name, uuid)");
+                return;
+            }
+            target = key;
+        }
+        // The stored line is the real command, so the loader checks it with Minecraft's own parser:
+        // a bad component or an unknown colour disables just this block at load time.
+        b.addSay("tellraw " + ("*".equals(target) ? "@a" : "<" + target + ">") + " " + component, target, guard(frames), ln);
+    }
+
+    private static void declareLocal(MdpBlock b, Deque<Frame> frames, String name, String rhs, int ln) {
+        b.markConditions();
+        if (!frames.isEmpty()) {
+            b.disable("line " + ln + ": declare locals at the top level of the block, before any 'if'");
+            return;
+        }
+        if (RESERVED_NAMES.contains(name)) { b.disable("line " + ln + ": '" + name + "' can't be used as a local name"); return; }
+        if (b.params().contains(name)) { b.disable("line " + ln + ": '" + name + "' is already a parameter"); return; }
+        if (b.locals().contains(name)) { b.disable("line " + ln + ": local '" + name + "' is already declared"); return; }
+        MdpExpr.Value v = parseValueText(b, rhs, ln);        // sees only the locals declared before this one
+        if (v != null) b.addLocal(name, v, ln);
+    }
+
+    private static void assignLocal(MdpBlock b, Deque<Frame> frames, String name, String rhs, int ln) {
+        b.markConditions();
+        if (!b.locals().contains(name)) {
+            b.disable("line " + ln + ": " + (b.params().contains(name)
+                ? "'" + name + "' is a parameter and can't be assigned to"
+                : "unknown local '" + name + "' (declare it first: local " + name + " = ...)"));
+            return;
+        }
+        MdpExpr.Value v = parseValueText(b, rhs, ln);
+        if (v != null) b.addAssign(name, v, guard(frames), ln);
+    }
+
+    /** Parses and validates the right-hand side of a local. On any problem the block is disabled and null is returned. */
+    private static MdpExpr.Value parseValueText(MdpBlock b, String text, int ln) {
+        if (text.isBlank()) {
+            b.disable("line " + ln + ": expected a value after '='");
+            return null;
+        }
+        try {
+            MdpExpr.Value v = MdpExpr.parseValue(text);
+            Set<String> vars = new LinkedHashSet<>(), paths = new LinkedHashSet<>(), players = new LinkedHashSet<>();
+            v.collect(vars, paths);
+            v.collectPlayers(players);
+            String err = checkRefs(b, vars, players);
+            if (err != null) { b.disable("line " + ln + ": " + err); return null; }
+            b.addListPaths(paths);
+            return v;
+        } catch (MdpExpr.ExprException e) {
+            b.disable("line " + ln + ": " + e.getMessage());
+            return null;
+        }
     }
 
     private static void openIf(MdpBlock b, Deque<Frame> frames, String text, int ln) {
@@ -316,10 +620,10 @@ public final class MdpParser {
     private static MdpExpr.Node parseCond(MdpBlock b, String text, int ln) {
         try {
             MdpExpr.Node n = MdpExpr.parse(text);
-            Set<String> vars = new LinkedHashSet<>();
-            Set<String> paths = new LinkedHashSet<>();
+            Set<String> vars = new LinkedHashSet<>(), paths = new LinkedHashSet<>(), players = new LinkedHashSet<>();
             n.collect(vars, paths);
-            String err = checkCondVars(b, vars);
+            n.collectPlayers(players);
+            String err = checkRefs(b, vars, players);
             if (err != null) {
                 b.disable("line " + ln + ": " + err);
                 return MdpExpr.TRUE;
@@ -332,17 +636,31 @@ public final class MdpParser {
         }
     }
 
+    /** Variables must exist, properties must be real, and 'has tag' / 'has team' must be given a player. */
+    private static String checkRefs(MdpBlock b, Set<String> vars, Set<String> players) {
+        String err = checkCondVars(b, vars);
+        if (err != null) return err;
+        for (String key : players) {
+            String base = MdpVars.baseName(key);
+            if (!b.isPlayerParam(base)) return "'has tag' / 'has team' needs a player, but <" + base + "> is not one";
+        }
+        return null;
+    }
+
     /** Unlike command lines, a condition has no plain-text fallback, so every <variable> must be real. */
     private static String checkCondVars(MdpBlock b, Set<String> keys) {
         for (String key : keys) {
             String base = MdpVars.baseName(key);
-            if (!b.params().contains(base)) {
+            boolean isLocal = b.locals().contains(base);
+            if (!b.params().contains(base) && !isLocal) {
                 StringBuilder have = new StringBuilder();
                 for (String p : b.params()) have.append(have.length() > 0 ? ", " : "").append('<').append(p).append('>');
-                return "unknown variable <" + key + ">" + (b.params().isEmpty() ? " (this block has no parameters)" : " (parameters: " + have + ")");
+                for (String l : b.locals()) have.append(have.length() > 0 ? ", " : "").append('<').append(l).append('>');
+                return "unknown variable <" + key + ">" + (have.length() == 0 ? " (this block has no parameters or locals)" : " (available: " + have + ")");
             }
             if (key.length() > base.length()) {
                 String prop = key.substring(base.length() + 1);
+                if (isLocal) return "<" + key + ">: '" + base + "' is a local variable and has no properties";
                 if (!b.isPlayerParam(base)) return "<" + key + ">: '" + base + "' is not a player, so it has no properties";
                 if (!MdpVars.PLAYER_PROPS.contains(prop)) return "<" + key + ">: unknown player property '" + prop + "' (available: name, uuid)";
             }
@@ -357,6 +675,7 @@ public final class MdpParser {
             Matcher m = VAR_REF.matcher(b.body().get(i));
             while (m.find()) {
                 String param = m.group(1), prop = m.group(2);
+                if (b.locals().contains(param)) { b.disable("line " + b.bodyLines().get(i) + ": <" + param + "." + prop + "> - '" + param + "' is a local variable and has no properties"); return; }
                 if (!b.params().contains(param)) continue;      // not one of this block's variables: plain text
                 String at = "line " + b.bodyLines().get(i) + ": <" + param + "." + prop + ">";
                 if (!b.isPlayerParam(param)) { b.disable(at + " - '" + param + "' is not a player, so it has no properties"); return; }

@@ -33,16 +33,41 @@ public final class JsonLists {
 
     /** Static check used when a script is loaded. Returns an error message, or null if the path is acceptable. */
     public static String checkPath(String rel) {
-        if (rel == null || rel.isBlank()) return "empty list file name";
-        if (rel.length() > 200) return "list file name is too long";
-        if (rel.contains("\\") || rel.contains(":") || rel.startsWith("/"))
-            return "list file '" + rel + "' must be a relative path under ModDataPacks (use '/')";
-        for (String seg : rel.split("/", -1)) {
-            if (seg.isEmpty()) return "list file '" + rel + "' has an empty path segment";
-            if (seg.equals("..") || seg.equals(".")) return "list file '" + rel + "' cannot use '.' or '..'";
-        }
+        String bad = checkRelPath(rel, "list file");
+        if (bad != null) return bad;
         if (!rel.endsWith(".json")) return "list file '" + rel + "' must end in .json";
         return null;
+    }
+
+    /**
+     * Rules for any path a script may name: relative, under ModDataPacks, '/' separators, no '.' or '..' segments.
+     * 'what' only changes the wording of the message ("list file", "path", ...).
+     */
+    public static String checkRelPath(String rel, String what) {
+        if (rel == null || rel.isBlank()) return "empty " + what + " name";
+        if (rel.length() > 200) return what + " name is too long";
+        if (rel.contains("\\") || rel.contains(":") || rel.startsWith("/"))
+            return what + " '" + rel + "' must be a relative path under ModDataPacks (use '/')";
+        for (String seg : rel.split("/", -1)) {
+            if (seg.isEmpty()) return what + " '" + rel + "' has an empty path segment";
+            if (seg.equals("..") || seg.equals(".")) return what + " '" + rel + "' cannot use '.' or '..'";
+        }
+        return null;
+    }
+
+    /** Whether a file or folder exists at this path under ModDataPacks. Anything that would leave that folder is an error. */
+    public boolean exists(String rel) throws ListException {
+        String bad = checkRelPath(rel, "path");
+        if (bad != null) throw new ListException(bad);
+        Path p = root.resolve(rel).normalize();
+        if (!p.startsWith(root)) throw new ListException("path '" + rel + "' is outside ModDataPacks");
+        if (!Files.exists(p)) return false;                 // a link to nowhere counts as missing
+        try {
+            if (!p.toRealPath().startsWith(root.toRealPath())) throw new ListException("path '" + rel + "' is outside ModDataPacks");
+        } catch (IOException e) {
+            throw new ListException("could not check '" + rel + "': " + e.getMessage());
+        }
+        return true;
     }
 
     public boolean contains(String rel, String value) throws ListException {

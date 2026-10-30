@@ -2,6 +2,7 @@ package net.kodyris.mdp.script;
 
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -20,10 +21,15 @@ public final class MdpVars {
 
     /** Single pass, so a substituted value is never itself re-substituted. Unknown names stay as text. */
     public static String substitute(String line, Map<String, String> vars) {
+        return substitute(line, vars::get);
+    }
+
+    /** Same, with the values supplied by a lookup that returns null for an unknown name. */
+    public static String substitute(String line, Function<String, String> lookup) {
         Matcher m = VAR.matcher(line);
         StringBuilder sb = new StringBuilder();
         while (m.find()) {
-            String v = vars.get(m.group(1));
+            String v = lookup.apply(m.group(1));
             m.appendReplacement(sb, Matcher.quoteReplacement(v != null ? v : m.group()));
         }
         m.appendTail(sb);
